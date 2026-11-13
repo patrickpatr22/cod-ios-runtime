@@ -1,0 +1,102 @@
+name: iOS runtime libraries
+
+# Builds only the runtime libraries and the app executable (no game modules:
+# there is no recompiled game code in this repository).
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 80
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime,clang_index_store
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Fetch ReXGlue SDK (iOS subset) and apply iOS patch
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 sdk
+          cd sdk
+          git submodule update --init --depth 1 --recursive --jobs 8 -- \
+            thirdparty/cli11 thirdparty/libmspack thirdparty/FFmpeg thirdparty/tomlplusplus \
+            thirdparty/simde thirdparty/xxHash thirdparty/spdlog thirdparty/fmt thirdparty/utfcpp \
+            thirdparty/imgui thirdparty/sdl3 thirdparty/vulkan-headers \
+            thirdparty/vulkan-memory-allocator thirdparty/spirv-headers thirdparty/spirv-tools \
+            thirdparty/glslang thirdparty/o1heap
+          git apply ../patches/rexglue-sdk-ios.patch
+
+      - name: Tools
+        run: brew install ccache ninja >/dev/null 2>&1 || true
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-runtime-${{ github.run_id }}
+          restore-keys: ccache-runtime-
+
+      - name: Configure (iOS arm64)
+        id: configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        id: build
+        timeout-minutes: 55
+        run: |
+          set -o pipefail
+          ninja -C build -k 0 callofduty 2>&1 | tee build.log | grep -E "error:|FAILED|Undefined symbols" | head -200 || true
+          test "${PIPESTATUS[0]}" = 0
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          app=$(find build -maxdepth 4 -name 'CallOfDuty.app' -type d | head -1)
+          cp "$app/CallOfDuty" out/
+          for lib in librexruntime.dylib librexgpu-xenos.dylib; do
+            f=$(find build -name "$lib" -type f | head -1)
+            cp "$f" out/
+          done
+          for f in out/*; do codesign --force --sign - --timestamp=none "$f"; done
+          ls -la out
+          shasum -a 256 out/* > out/SHA256SUMS
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-runtime
+          path: out/
+          retention-days: 3
+
+      - name: Save compiler cache
+        if: always() && steps.configure.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-runtime-${{ github.run_id }}

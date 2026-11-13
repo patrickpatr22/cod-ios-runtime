@@ -1,0 +1,14 @@
+# Recompiled game code and game files never go into git (only encrypted, see
+# scripts/codegen.sh and the game-data branch).
+/generated/
+/game/
+*.xex
+*.xexp
+*.iso
+*.ipa
+
+# Build output
+/build*/
+/out/
+*.log
+.DS_Store
