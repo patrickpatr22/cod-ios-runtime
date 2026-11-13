@@ -7422,6 +7422,46 @@ index 8778066..4eb19f9 100644
  REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
  REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
  REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..58479e1 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -173,6 +174,13 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+   }
+   if (!address) {
+     // Failed - assume no memory available.
++    static std::atomic<uint32_t> failures{0};
++    if (failures.fetch_add(1, std::memory_order_relaxed) < 32) {
++      REXKRNL_WARN("NtAllocateVirtualMemory: kein Platz fuer {:#x} Bytes (Basis {:#x}, Seiten {:#x}, "
++                   "Typ {:#x}) - Speicher des Spiels voll?",
++                   uint32_t(adjusted_size), uint32_t(adjusted_base), uint32_t(page_size),
++                   uint32_t(alloc_type));
++    }
+     return X_STATUS_NO_MEMORY;
+   }
+ 
+@@ -400,6 +408,13 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
+   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size, adjusted_alignment,
+                         allocation_type, protect, top_down, &base_address)) {
+     // Failed - assume no memory available.
++    static std::atomic<uint32_t> failures{0};
++    if (failures.fetch_add(1, std::memory_order_relaxed) < 32) {
++      REXKRNL_WARN("MmAllocatePhysicalMemoryEx: kein Platz fuer {:#x} Bytes (Seiten {:#x}, "
++                   "Bereich {:#x}-{:#x}) - Speicher des Spiels voll?",
++                   uint32_t(adjusted_size), uint32_t(page_size), uint32_t(min_addr_range),
++                   uint32_t(max_addr_range));
++    }
+     return 0;
+   }
+   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 index 57fd161..7bbe04e 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp

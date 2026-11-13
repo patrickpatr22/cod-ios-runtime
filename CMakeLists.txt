@@ -141,6 +141,7 @@ set(COD_APP_SOURCES
     ${COD_EMBEDDED_FONTS}
     src/ios_boot.cpp
     src/diagnostics.cpp
+    src/bo1_streams.cpp
     src/settings.cpp
 )
 

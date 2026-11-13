@@ -2,6 +2,8 @@
 
 #include "diagnostics.h"
 
+#include "bo1_streams.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -801,6 +803,7 @@ void ReportCrash(int signal_number, uint64_t fault_address, uint64_t pc, uint64_
   void* frames[64];
   const int frame_count = backtrace(frames, 64);
   backtrace_symbols_fd(frames, frame_count, fd);
+  cod::Bo1StreamCrashDump(fd);
   close(fd);
 }
 

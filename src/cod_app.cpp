@@ -13,6 +13,8 @@
 #include <system_error>
 #include <thread>
 
+#include <dlfcn.h>
+
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/module.h>
@@ -30,6 +32,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/window.h>
 
+#include "bo1_streams.h"
 #include "diagnostics.h"
 #include "game_loader.h"
 #include "launcher.h"
@@ -65,7 +68,7 @@ constexpr const char* kLegacyManagedMarker = "# bo2-ios-defaults";
 // Counts app starts for the rotation; renamed per test round so every round
 // starts with profile A.
 constexpr const char* kTestCounterFile = "grafiktest-runde12.txt";
-constexpr const char* kBuildLabel = "Build 35";
+constexpr const char* kBuildLabel = "Build 36";
 
 struct GraphicsProfile {
   const char* letter;
@@ -835,6 +838,11 @@ void CodApp::RestoreLaunchData() {
 
 void CodApp::OnPreLaunchModule() {
   RestoreLaunchData();
+  if (module_ && std::string_view(module_->id) == "bo1_sp") {
+    Dl_info info = {};
+    const void* module_base = dladdr(module_, &info) ? info.dli_fbase : nullptr;
+    cod::StartBo1StreamWatch(runtime()->memory()->virtual_membase(), module_base);
+  }
   if (game_->zombies_flag_address == 0 || std::string_view(mode_->id) != "zombies") {
     return;
   }
