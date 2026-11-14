@@ -6,6 +6,12 @@
 // and that buffer was address 0. The module of build 36 (patched) lets such
 // a job fail like a damaged block and keeps a copy of the request; this
 // reports it, and the crash report lists the open requests.
+//
+// Build 37: the game's LZO decompressor ignores the size of the target, so a
+// block that is not what the request expects overwrites whatever follows the
+// buffer. The module of build 37 decompresses stream blocks with a bounded
+// decoder instead (same bytes for valid blocks); a block that would overflow
+// fails like a damaged one and is reported here with its pack and offset.
 
 #pragma once
 

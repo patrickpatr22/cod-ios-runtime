@@ -45,8 +45,56 @@ constexpr uintptr_t kHookOffset = 0x880A20;
 constexpr uint32_t kHookWord = 0x17DE1978;        // b 0x7000
 constexpr uintptr_t kRecordOffset = 0x1B8F000;
 
+// Build 37 (scripts/module_patches/bo1_sp_safe_lzo.py): the stream path calls
+// a bounded LZO decompressor (stub at 0x1000) instead of the game's own,
+// which ignores the size of the target. Record at 0x1B8F400 (host words):
+// errors, last code, source, its length, target, capacity, written,
+// request index, pack entry, pack offset, calls, -, 16 bytes of the input.
+constexpr uintptr_t kLzoStubOffset = 0x1000;
+constexpr uint32_t kLzoStubWord = 0xD000DC62;     // adrp x2, record page
+constexpr uintptr_t kLzoCallOffset = 0x163D094;
+constexpr uint32_t kLzoCallWord = 0x97A70FDB;     // bl stub
+constexpr uintptr_t kLzoRecordOffset = 0x1B8F400;
+
 std::atomic<const uint8_t*> g_guest_base{nullptr};
 std::atomic<const uint8_t*> g_record{nullptr};
+std::atomic<const uint8_t*> g_lzo_record{nullptr};
+
+inline uint32_t Host32(const uint8_t* bytes, size_t offset) {
+  uint32_t value;
+  std::memcpy(&value, bytes + offset, sizeof(value));
+  return value;
+}
+
+const char* LzoError(int32_t code) {
+  switch (code) {
+    case -4: return "Eingabe zu kurz";
+    case -5: return "Ziel zu klein";
+    case -6: return "Rueckverweis ausserhalb";
+    case -8: return "Eingabe nicht aufgebraucht";
+    case -9: return "Adressen ungueltig";
+    default: return "Fehler";
+  }
+}
+
+std::string PackPath(const uint8_t* guest, uint32_t entry);
+
+void LogLzoRecord(const uint8_t* guest, const uint8_t* record, uint32_t errors) {
+  const uint32_t pack_entry = Host32(record, 32);
+  std::string head;
+  for (int i = 0; i < 16; ++i) {
+    head += fmt::format("{:02X}", record[48 + i]);
+  }
+  const uint32_t request = Host32(record, 28);
+  REXLOG_WARN(
+      "Stream-Block abgewiesen (insgesamt {} von {} entpackten): {} ({}), Paket {} Versatz {:X}, "
+      "Anfrage {}, Quelle {:08X} Laenge {:X}, Ziel {:08X} Platz {:X}, geschrieben {:X}, "
+      "Anfang {}",
+      errors, Host32(record, 40), LzoError(int32_t(Host32(record, 4))), int32_t(Host32(record, 4)),
+      PackPath(guest, pack_entry), Host32(record, 36),
+      request == 0xFFFFFFFFu ? std::string("?") : std::to_string(request), Host32(record, 8),
+      Host32(record, 12), Host32(record, 16), Host32(record, 20), Host32(record, 24), head);
+}
 
 inline uint32_t Guest32(const uint8_t* base, uint32_t address) {
   uint32_t value;
@@ -140,25 +188,48 @@ void StartBo1StreamWatch(const uint8_t* guest_base, const void* module_base) {
       record = module + kRecordOffset;
     }
   }
+  const uint8_t* lzo_record = nullptr;
+  if (module && record) {
+    uint32_t stub_word = 0;
+    uint32_t call_word = 0;
+    std::memcpy(&stub_word, module + kLzoStubOffset, 4);
+    std::memcpy(&call_word, module + kLzoCallOffset, 4);
+    if (stub_word == kLzoStubWord && call_word == kLzoCallWord) {
+      lzo_record = module + kLzoRecordOffset;
+    }
+  }
   g_record = record;
-  REXLOG_WARN("Black Ops: Stream-Schutz {}", record ? "aktiv (Spielcode mit Build-36-Korrektur)"
-                                                     : "nicht im Spielcode");
+  g_lzo_record = lzo_record;
+  REXLOG_WARN("Black Ops: Stream-Schutz {}, begrenztes Entpacken {}",
+              record ? "aktiv" : "nicht im Spielcode", lzo_record ? "aktiv" : "nicht im Spielcode");
   if (!record) {
     return;
   }
-  std::thread([guest_base, record]() {
+  std::thread([guest_base, record, lzo_record]() {
     uint32_t reported = 0;
+    uint32_t lzo_reported = 0;
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      bool flush = false;
       uint32_t count = 0;
       std::memcpy(&count, record, sizeof(count));
-      if (count == reported) {
-        continue;
+      if (count != reported) {
+        // Several in a row: the first, then at most a few lines a second.
+        LogRecord(guest_base, record, count, reported == 0);
+        reported = count;
+        flush = true;
       }
-      // Several in a row: the first, then at most one line a second.
-      LogRecord(guest_base, record, count, reported == 0);
-      reported = count;
-      rex::FlushLogging();
+      if (lzo_record) {
+        const uint32_t errors = Host32(lzo_record, 0);
+        if (errors != lzo_reported) {
+          LogLzoRecord(guest_base, lzo_record, errors);
+          lzo_reported = errors;
+          flush = true;
+        }
+      }
+      if (flush) {
+        rex::FlushLogging();
+      }
     }
   }).detach();
 }
@@ -199,6 +270,18 @@ void Bo1StreamCrashDump(int fd) {
     std::memcpy(&count, record, sizeof(count));
     CrashWrite(fd, "Abgefangene Streams ohne Zielpuffer: ");
     CrashHex(fd, count);
+    CrashWrite(fd, "\n");
+  }
+  if (const uint8_t* lzo = g_lzo_record.load()) {
+    CrashWrite(fd, "Begrenztes Entpacken: Aufrufe ");
+    CrashHex(fd, Host32(lzo, 40));
+    CrashWrite(fd, ", abgewiesen ");
+    CrashHex(fd, Host32(lzo, 0));
+    CrashWrite(fd, ", zuletzt Code/Quelle/Laenge/Ziel/Platz/geschrieben/Anfrage/Paket/Versatz ");
+    for (size_t offset = 4; offset <= 36; offset += 4) {
+      CrashHex(fd, Host32(lzo, offset));
+      CrashWrite(fd, " ");
+    }
     CrashWrite(fd, "\n");
   }
 }

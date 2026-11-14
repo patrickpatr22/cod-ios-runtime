@@ -94,10 +94,21 @@ index 8edc796..d86d783 100644
    virtual const std::string& name() const = 0;
    virtual uint32_t attributes() const = 0;
 diff --git a/include/rex/filesystem/devices/stfs_container_device.h b/include/rex/filesystem/devices/stfs_container_device.h
-index f33d46c..7bbfdb0 100644
+index f33d46c..f26dc20 100644
 --- a/include/rex/filesystem/devices/stfs_container_device.h
 +++ b/include/rex/filesystem/devices/stfs_container_device.h
-@@ -44,6 +44,14 @@ class StfsContainerDevice : public Device {
+@@ -18,6 +18,10 @@
+ #include <string>
+ #include <unordered_map>
+ 
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <rex/filesystem/device.h>
+ #include <rex/math.h>
+ #include <rex/string.h>
+@@ -44,6 +48,20 @@ class StfsContainerDevice : public Device {
  
    void Dump(string::StringBuffer* string_buffer) override;
    Entry* ResolvePath(const std::string_view path) override;
@@ -109,10 +120,16 @@ index f33d46c..7bbfdb0 100644
 +  // "<name>.<language>.<ext>" resolves to the package's own language variant
 +  // (English first).
 +  void set_language_fallback(bool enabled) { language_fallback_ = enabled; }
++
++  // Checks a file of the package against the SHA-1 hashes of its blocks
++  // (each 4 KB block has one in the package's hash tables), once per file,
++  // on a background thread of this device. Logs the result. Tells whether
++  // the block mapping hands the title the package's real data.
++  void QueueVerify(StfsContainerEntry* entry);
  
    const std::string& name() const override { return name_; }
    uint32_t attributes() const override { return 0; }
-@@ -103,6 +111,10 @@ class StfsContainerDevice : public Device {
+@@ -103,6 +121,10 @@ class StfsContainerDevice : public Device {
      kSingleFile = 0x4,
    };
  
@@ -123,11 +140,36 @@ index f33d46c..7bbfdb0 100644
    XContentPackageType ReadMagic(const std::filesystem::path& path);
    bool ResolveFromFolder(const std::filesystem::path& path);
  
+@@ -122,6 +144,16 @@ class StfsContainerDevice : public Device {
+ 
+   const StfsHashEntry* GetBlockHash(uint32_t block_index);
+ 
++  void VerifyThread();
++  void VerifyEntry(StfsContainerEntry* entry);
++  std::mutex verify_mutex_;
++  std::condition_variable verify_cv_;
++  std::deque<StfsContainerEntry*> verify_queue_;
++  std::thread verify_thread_;
++  bool verify_stop_ = false;
++  // GetBlockHash and cached_hash_tables_ after mounting (verify thread).
++  std::mutex hash_mutex_;
++
+   std::string name_;
+   std::filesystem::path host_path_;
+ 
 diff --git a/include/rex/filesystem/devices/stfs_container_entry.h b/include/rex/filesystem/devices/stfs_container_entry.h
-index 45d7254..2126515 100644
+index 45d7254..e1593d2 100644
 --- a/include/rex/filesystem/devices/stfs_container_entry.h
 +++ b/include/rex/filesystem/devices/stfs_container_entry.h
-@@ -46,6 +46,14 @@ class StfsContainerEntry : public Entry {
+@@ -13,6 +13,7 @@
+ 
+ #include <map>
+ #include <string>
++#include <atomic>
+ #include <vector>
+ 
+ #include <rex/filesystem/entry.h>
+@@ -46,6 +47,20 @@ class StfsContainerEntry : public Entry {
      size_t length;
    };
    const std::vector<BlockRecord>& block_list() const { return block_list_; }
@@ -139,14 +181,22 @@ index 45d7254..2126515 100644
 +  // it continues it. Then FinishBlockList() once all runs are in.
 +  void AppendBlockRun(size_t file, size_t offset, size_t length);
 +  void FinishBlockList();
++
++  // STFS block numbers of the file in order (for the background check of
++  // the package hashes, see StfsContainerDevice::QueueVerify).
++  const std::vector<uint32_t>& block_numbers() const { return block_numbers_; }
++  // True the first time only: the file is checked once per session.
++  bool MarkVerifyQueued() { return !verify_queued_.exchange(true); }
  
   private:
    friend class StfsContainerDevice;
-@@ -55,6 +63,7 @@ class StfsContainerEntry : public Entry {
+@@ -55,6 +70,9 @@ class StfsContainerEntry : public Entry {
    size_t data_size_;
    size_t block_;
    std::vector<BlockRecord> block_list_;
 +  std::vector<uint64_t> block_starts_;
++  std::vector<uint32_t> block_numbers_;
++  std::atomic<bool> verify_queued_{false};
  };
  
  }  // namespace rex::filesystem
@@ -2261,19 +2311,197 @@ index 9ac8d15..a6d9460 100644
    }
  
    current_thread_ = nullptr;
+diff --git a/src/filesystem/CMakeLists.txt b/src/filesystem/CMakeLists.txt
+index 577e4c9..6a3b858 100644
+--- a/src/filesystem/CMakeLists.txt
++++ b/src/filesystem/CMakeLists.txt
+@@ -33,4 +33,5 @@ target_include_directories(rexfilesystem PUBLIC
+     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+ )
+-target_include_directories(rexfilesystem PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/devices)
++target_include_directories(rexfilesystem PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/devices
++    ${REXGLUE_ROOT}/thirdparty)
 diff --git a/src/filesystem/devices/stfs_container_device.cpp b/src/filesystem/devices/stfs_container_device.cpp
-index 7062520..d8ce20e 100644
+index 7062520..ae3bdb2 100644
 --- a/src/filesystem/devices/stfs_container_device.cpp
 +++ b/src/filesystem/devices/stfs_container_device.cpp
-@@ -18,6 +18,7 @@
+@@ -13,13 +13,33 @@
+ #include <rex/filesystem/devices/stfs_container_entry.h>
  
+ #include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
+ #include <queue>
++#include <string>
+ #include <vector>
+ 
++#if REX_PLATFORM_MAC
++#include <pthread.h>
++#include <sys/qos.h>
++#endif
++#include <unistd.h>
++
++#include <fmt/format.h>
++
++#include "crypto/TinySHA1.hpp"
++
++#include <rex/cvar.h>
  #include <rex/logging.h>
  #include <rex/math.h>
 +#include <rex/string/utf8.h>
  #include <rex/system/xio.h>
  
++REXCVAR_DEFINE_BOOL(content_verify_packages, true, "Kernel",
++                    "Check every file opened from a content package (STFS) once against "
++                    "the SHA-1 hashes of its blocks, in the background, and log the result");
++
  namespace rex::filesystem {
-@@ -186,7 +187,113 @@ Entry* StfsContainerDevice::ResolvePath(const std::string_view path) {
+ 
+ StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
+@@ -35,9 +55,140 @@ StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
+       block_step{0, 0} {}
+ 
+ StfsContainerDevice::~StfsContainerDevice() {
++  {
++    std::lock_guard<std::mutex> lock(verify_mutex_);
++    verify_stop_ = true;
++    verify_queue_.clear();
++  }
++  verify_cv_.notify_all();
++  if (verify_thread_.joinable()) {
++    verify_thread_.join();
++  }
+   CloseFiles();
+ }
+ 
++void StfsContainerDevice::QueueVerify(StfsContainerEntry* entry) {
++  if (!entry || header_.metadata.volume_type != XContentVolumeType::kStfs ||
++      entry->block_numbers().empty() || !REXCVAR_GET(content_verify_packages) ||
++      !entry->MarkVerifyQueued()) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> lock(verify_mutex_);
++    if (verify_stop_) {
++      return;
++    }
++    verify_queue_.push_back(entry);
++    if (!verify_thread_.joinable()) {
++      verify_thread_ = std::thread([this]() { VerifyThread(); });
++    }
++  }
++  verify_cv_.notify_one();
++}
++
++void StfsContainerDevice::VerifyThread() {
++#if REX_PLATFORM_MAC
++  pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++#endif
++  while (true) {
++    StfsContainerEntry* entry = nullptr;
++    {
++      std::unique_lock<std::mutex> lock(verify_mutex_);
++      verify_cv_.wait(lock, [this]() { return verify_stop_ || !verify_queue_.empty(); });
++      if (verify_stop_) {
++        return;
++      }
++      entry = verify_queue_.front();
++      verify_queue_.pop_front();
++    }
++    VerifyEntry(entry);
++  }
++}
++
++void StfsContainerDevice::VerifyEntry(StfsContainerEntry* entry) {
++  const auto start = std::chrono::steady_clock::now();
++  const std::vector<uint32_t>& blocks = entry->block_numbers();
++  FILE* file = files_.at(0);
++  const int fd = fileno(file);
++  std::vector<uint8_t> data(kBlockSize);
++  size_t bad = 0, missing = 0, chain_off = 0, short_reads = 0;
++  size_t first_bad = SIZE_MAX, first_chain_off = SIZE_MAX;
++  for (size_t i = 0; i < blocks.size(); ++i) {
++    {
++      std::lock_guard<std::mutex> lock(verify_mutex_);
++      if (verify_stop_) {
++        return;
++      }
++    }
++    const uint32_t block = blocks[i];
++    const uint64_t offset = BlockToOffsetSTFS(block);
++    size_t done = 0;
++    while (done < kBlockSize) {
++      const ssize_t got = pread(fd, data.data() + done, kBlockSize - done, off_t(offset + done));
++      if (got > 0) {
++        done += size_t(got);
++      } else if (got < 0 && errno == EINTR) {
++        continue;
++      } else {
++        break;
++      }
++    }
++    if (done < kBlockSize) {
++      std::memset(data.data() + done, 0, kBlockSize - done);
++      ++short_reads;
++    }
++    StfsHashEntry hash = {};
++    {
++      std::lock_guard<std::mutex> lock(hash_mutex_);
++      const StfsHashEntry* found = GetBlockHash(block);
++      if (!found) {
++        ++missing;
++        continue;
++      }
++      hash = *found;
++    }
++    sha1::SHA1 sha;
++    sha.processBytes(data.data(), kBlockSize);
++    uint8_t digest[20];
++    sha.finalize(digest);
++    if (std::memcmp(digest, hash.sha1, sizeof(digest)) != 0) {
++      if (!bad) {
++        first_bad = i;
++      }
++      ++bad;
++    }
++    if (i + 1 < blocks.size() && hash.level0_next_block() != blocks[i + 1]) {
++      if (!chain_off) {
++        first_chain_off = i;
++      }
++      ++chain_off;
++    }
++  }
++  {
++    std::lock_guard<std::mutex> lock(hash_mutex_);
++    cached_hash_tables_.clear();
++  }
++  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now() - start)
++                      .count();
++  const std::string package = rex::path_to_utf8(host_path_.filename());
++  if (!bad && !missing && !short_reads) {
++    REXFS_WARN("STFS-Pruefung {} {}: {} Bloecke, alle passen zum Hash ({} ms){}", package,
++               entry->path(), blocks.size(), ms,
++               chain_off ? fmt::format(", Kette im Hash weicht {} mal ab (erstmals nach Block {})",
++                                       chain_off, first_chain_off)
++                         : std::string());
++  } else {
++    REXFS_WARN(
++        "STFS-Pruefung {} {}: {} von {} Bloecken FALSCH (erster: Block {} = Paketblock {}, "
++        "Dateiversatz {:X}), {} ohne Hash, {} kurz gelesen, Kette weicht {} mal ab ({} ms)",
++        package, entry->path(), bad, blocks.size(), first_bad,
++        first_bad < blocks.size() ? blocks[first_bad] : 0,
++        first_bad < blocks.size() ? uint64_t(first_bad) * kBlockSize : 0, missing, short_reads,
++        chain_off, ms);
++  }
++}
++
+ std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
+     const std::filesystem::path& file_path) {
+   if (!std::filesystem::exists(file_path)) {
+@@ -186,7 +337,113 @@ Entry* StfsContainerDevice::ResolvePath(const std::string_view path) {
    // be in the form:
    // some\PATH.foo
    REXFS_DEBUG("StfsContainerDevice::ResolvePath({})", path);
@@ -2388,7 +2616,7 @@ index 7062520..d8ce20e 100644
  }
  
  StfsContainerDevice::Error StfsContainerDevice::ReadHeaderAndVerify(FILE* header_file) {
-@@ -596,21 +703,37 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+@@ -596,21 +853,40 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
  
        all_entries.push_back(entry.get());
  
@@ -2416,6 +2644,7 @@ index 7062520..d8ce20e 100644
 +          while (remaining_size) {
 +            size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
 +            entry->AppendBlockRun(0, BlockToOffsetSTFS(block_index), block_size);
++            entry->block_numbers_.push_back(block_index);
 +            remaining_size -= block_size;
 +            ++block_index;
 +            ++block_count;
@@ -2424,6 +2653,7 @@ index 7062520..d8ce20e 100644
 +          while (remaining_size && block_index != kEndOfChain) {
 +            size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
 +            entry->AppendBlockRun(0, BlockToOffsetSTFS(block_index), block_size);
++            entry->block_numbers_.push_back(block_index);
 +            remaining_size -= block_size;
 +            ++block_count;
 +            auto block_hash = GetBlockHash(block_index);
@@ -2434,10 +2664,11 @@ index 7062520..d8ce20e 100644
 +          }
          }
 +        entry->FinishBlockList();
++        entry->block_numbers_.shrink_to_fit();
  
          if (remaining_size) {
            // Loop above must have exited prematurely, bad hash tables?
-@@ -619,17 +742,15 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+@@ -619,17 +895,15 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
                "bytes missing)",
                name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
                remaining_size);
@@ -2457,7 +2688,7 @@ index 7062520..d8ce20e 100644
          }
        }
  
-@@ -646,9 +767,12 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+@@ -646,9 +920,12 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
    if (n + 1 != descriptor.file_table_block_count) {
      REXFS_WARN("STFS read {} file table blocks, but STFS headers expected {}!", n + 1,
                 descriptor.file_table_block_count);
@@ -2472,10 +2703,18 @@ index 7062520..d8ce20e 100644
  }
  
 diff --git a/src/filesystem/devices/stfs_container_entry.cpp b/src/filesystem/devices/stfs_container_entry.cpp
-index 8535944..1eb7a03 100644
+index 8535944..c584b13 100644
 --- a/src/filesystem/devices/stfs_container_entry.cpp
 +++ b/src/filesystem/devices/stfs_container_entry.cpp
-@@ -33,6 +33,28 @@ std::unique_ptr<StfsContainerEntry> StfsContainerEntry::Create(Device* device, E
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/filesystem/devices/stfs_container_entry.h>
+ #include <rex/filesystem/devices/stfs_container_file.h>
+ 
+@@ -33,7 +34,32 @@ std::unique_ptr<StfsContainerEntry> StfsContainerEntry::Create(Device* device, E
    return std::move(entry);
  }
  
@@ -2502,8 +2741,12 @@ index 8535944..1eb7a03 100644
 +}
 +
  X_STATUS StfsContainerEntry::Open(uint32_t desired_access, File** out_file) {
++  if (auto* stfs = dynamic_cast<StfsContainerDevice*>(device())) {
++    stfs->QueueVerify(this);
++  }
    *out_file = new StfsContainerFile(desired_access, this);
    return X_STATUS_SUCCESS;
+ }
 diff --git a/src/filesystem/devices/stfs_container_file.cpp b/src/filesystem/devices/stfs_container_file.cpp
 index 0dd13f3..da8cc01 100644
 --- a/src/filesystem/devices/stfs_container_file.cpp
@@ -2613,10 +2856,26 @@ index 0dd13f3..da8cc01 100644
      }
    }
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
-index a1b4dad..6b627f9 100644
+index a1b4dad..21d3814 100644
 --- a/src/filesystem/virtual_file_system.cpp
 +++ b/src/filesystem/virtual_file_system.cpp
-@@ -225,6 +225,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+@@ -13,7 +13,15 @@
+ #include <rex/logging.h>
+ #include <rex/string.h>
+ 
++#include <mutex>
++#include <set>
++
+ #include <rex/filesystem/devices/host_path_entry.h>
++#include <rex/filesystem/devices/stfs_container_device.h>
++
++REXCVAR_DEFINE_BOOL(content_skip_package_movies, true, "Filesystem",
++                    "Bink movies (.bik) inside content packages (DLC map packs) count as "
++                    "missing, so the title shows its loading screen without the movie");
+ 
+ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
+                     "Not useful to non-developers. Allows code to write to paths "
+@@ -225,10 +233,33 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
  
      auto file_name = rex::string::utf8_find_name_from_guest_path(path);
      entry = parent_entry->GetChild(file_name);
@@ -2628,6 +2887,28 @@ index a1b4dad..6b627f9 100644
    } else {
      entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
    }
+ 
++  if (entry && !(entry->attributes() & kFileAttributeDirectory) &&
++      REXCVAR_GET(content_skip_package_movies) &&
++      dynamic_cast<StfsContainerDevice*>(entry->device())) {
++    const std::string& name = entry->name();
++    if (name.size() > 4 && rex::string::utf8_equal_case(
++                               std::string_view(name).substr(name.size() - 4), ".bik")) {
++      static std::mutex logged_mutex;
++      static std::set<std::string> logged;
++      {
++        std::lock_guard<std::mutex> lock(logged_mutex);
++        if (logged.insert(std::string(path)).second) {
++          REXFS_WARN("Kartenpaket: Film {} ausgelassen (content_skip_package_movies)", path);
++        }
++      }
++      entry = nullptr;
++    }
++  }
++
+   if (entry) {
+     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
+       return X_STATUS_FILE_IS_A_DIRECTORY;
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 index 0d8f8af..8d38c4a 100644
 --- a/src/graphics/CMakeLists.txt
@@ -7659,10 +7940,78 @@ index 1254710..c11e61f 100644
  
  void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
-index bd43109..b30321f 100644
+index bd43109..412ac41 100644
 --- a/src/system/function_dispatcher.cpp
 +++ b/src/system/function_dispatcher.cpp
-@@ -146,6 +146,16 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
+@@ -13,11 +13,16 @@
+  *              role as a function dispatch table rather than a CPU emulator.
+  */
+ 
++#include <string>
++
++#include <fmt/format.h>
++
+ #include <rex/assert.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
+ #include <rex/memory.h>
++#include <rex/memory/utils.h>
+ #include <rex/ppc/context.h>
+ #include <rex/runtime.h>
+ #include <rex/system/function_dispatcher.h>
+@@ -34,7 +39,49 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
+-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
++// Guest bytes at an address the registers point to, when that memory can be
++// read (for the message of the trap below).
++static std::string GuestBytesForTrap(uint8_t* base, uint32_t address, uint32_t length) {
++  if (!base || address < 0x10000 || length == 0) {
++    return {};
++  }
++  uint8_t* host = base + address + (address >= 0xE0000000u ? 0x1000u : 0u);
++  size_t query_length = length;
++  rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
++  if (!rex::memory::QueryProtect(host, query_length, access) ||
++      access == rex::memory::PageAccess::kNoAccess || query_length < length) {
++    return {};
++  }
++  std::string text;
++  for (uint32_t i = 0; i < length; ++i) {
++    text += fmt::format("{}{:02X}", i && !(i % 4) ? " " : "", host[i]);
++  }
++  return text;
++}
++
++static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
++  // The registers and what the pointer registers point to, so a damaged
++  // pointer table or command list can be found from the log.
++  // r3 comes first in PPCContext, then r0 to r2 and r4 to r31.
++  const uint32_t gpr[32] = {
++      ctx.r0.u32,  ctx.r1.u32,  ctx.r2.u32,  ctx.r3.u32,  ctx.r4.u32,  ctx.r5.u32,  ctx.r6.u32,
++      ctx.r7.u32,  ctx.r8.u32,  ctx.r9.u32,  ctx.r10.u32, ctx.r11.u32, ctx.r12.u32, ctx.r13.u32,
++      ctx.r14.u32, ctx.r15.u32, ctx.r16.u32, ctx.r17.u32, ctx.r18.u32, ctx.r19.u32, ctx.r20.u32,
++      ctx.r21.u32, ctx.r22.u32, ctx.r23.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32,
++      ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32};
++  std::string registers;
++  for (int i = 0; i < 32; ++i) {
++    registers += fmt::format("{}r{}={:08X}", i ? " " : "", i, gpr[i]);
++  }
++  REXLOG_ERROR("Ungueltiger Sprung nach {:08X}, LR {:08X} | {}", ctx.last_indirect_target,
++               uint32_t(ctx.lr), registers);
++  for (int i : {3, 4, 9, 10, 11, 29, 30, 31}) {
++    const uint32_t address = gpr[i];
++    std::string bytes = GuestBytesForTrap(base, address & ~3u, 64);
++    if (!bytes.empty()) {
++      REXLOG_ERROR("  r{} -> {:08X}: {}", i, address & ~3u, bytes);
++    }
++  }
+   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+             ctx.last_indirect_target);
+ }
+@@ -146,6 +193,16 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
  
    // Hold the global lock during interrupt dispatch.
    auto global_lock = global_critical_region_.Acquire();
