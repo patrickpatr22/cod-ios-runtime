@@ -239,6 +239,7 @@ class PcProfiler {
     }
     auto next_refresh = std::chrono::steady_clock::now();
     auto next_report = next_refresh + std::chrono::seconds(10);
+    auto next_snapshot = next_refresh + std::chrono::seconds(30);
     for (;;) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= next_refresh) {
@@ -252,13 +253,18 @@ class PcProfiler {
         Report();
         next_report = now + std::chrono::seconds(10);
       }
+      if (now >= next_snapshot) {
+        SnapshotAll();
+        next_snapshot = now + std::chrono::seconds(30);
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
  private:
   static constexpr size_t kMaxTargets = 6;
-  static constexpr size_t kMaxFrames = 24;
+  static constexpr size_t kMaxFrames = 48;
+  static constexpr size_t kGameFrames = 16;
 
   struct Target {
     mach_port_t port = MACH_PORT_NULL;
@@ -275,6 +281,9 @@ class PcProfiler {
     // First two frames in the SDK libraries (GPU plugin, runtime, MoltenVK),
     // the innermost one and its caller, e.g. which code waits on a mutex.
     std::unordered_map<uintptr_t, uint32_t> engine;
+    // The chain of recompiled game functions (libcod_*.dylib, innermost
+    // first), so a wait or a hang can be traced to the game's own code.
+    std::unordered_map<uint64_t, uint32_t> game;
   };
 
   struct Symbol {
@@ -283,6 +292,8 @@ class PcProfiler {
     bool in_app = false;
     bool in_system = false;
     bool in_engine = false;
+    bool in_game = false;     // a recompiled game module (libcod_*)
+    std::string short_name;   // symbol without module, "sub_" or "__imp__sub_" dropped
   };
 
   static uintptr_t StripPointer(uint64_t address) {
@@ -371,6 +382,97 @@ class PcProfiler {
     return fmt::format("Thread {:X}", thread);
   }
 
+  // Every 30 s one look at every game thread, also the ones that sleep or
+  // wait (the profile above only samples busy threads): where it is in the
+  // game's code and the innermost SDK function (e.g. XThread::Delay, a wait).
+  // A loading screen that never ends shows here which thread waits for what.
+  void SnapshotAll() {
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t thread_count = 0;
+    if (task_threads(mach_task_self(), &threads, &thread_count) != KERN_SUCCESS) {
+      return;
+    }
+    std::vector<std::string> lines;
+    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+      const mach_port_t port = threads[i];
+      if (port != self_) {
+        std::string name = ThreadName(port);
+        if (name.rfind("Thread ", 0) != 0 && name.rfind("COD ", 0) != 0) {
+          uintptr_t frames[kMaxFrames];
+          size_t frame_count = 0;
+          uintptr_t link = 0;
+          CaptureFrames(port, frames, &frame_count, &link);
+          std::string chain;
+          std::string engine;
+          uintptr_t last_game = 0;
+          size_t game_count = 0;
+          for (size_t f = 0; f < frame_count; ++f) {
+            const Symbol& symbol = Lookup(f ? frames[f] - 1 : frames[f]);
+            if (symbol.in_game) {
+              if (symbol.start != last_game && game_count < kGameFrames) {
+                chain += (game_count ? "<" : "") + symbol.short_name;
+                last_game = symbol.start;
+                ++game_count;
+              }
+            } else if (symbol.in_engine && engine.empty() && !game_count) {
+              engine = symbol.text;
+            }
+          }
+          if (game_count) {
+            lines.push_back(fmt::format("Stapel {}: {} | {}", name, chain,
+                                        engine.empty() ? std::string("-") : engine));
+          }
+        }
+      }
+      mach_port_deallocate(mach_task_self(), port);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+                  thread_count * sizeof(thread_act_t));
+    std::sort(lines.begin(), lines.end());
+    for (const std::string& line : lines) {
+      REXLOG_WARN("{}", line);
+    }
+  }
+
+  void CaptureFrames(mach_port_t port, uintptr_t* frames, size_t* out_count, uintptr_t* out_link) {
+    size_t frame_count = 0;
+    uintptr_t link = 0;
+    pthread_t pthread = pthread_from_mach_thread_np(port);
+    uintptr_t stack_high = 0, stack_low = 0;
+    if (pthread) {
+      stack_high = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread));
+      stack_low = stack_high - pthread_get_stacksize_np(pthread);
+    }
+    // Nothing between suspend and resume may allocate or take a lock.
+    if (thread_suspend(port) == KERN_SUCCESS) {
+      arm_thread_state64_t state;
+      mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+      if (thread_get_state(port, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state),
+                           &count) == KERN_SUCCESS) {
+        frames[frame_count++] = StripPointer(arm_thread_state64_get_pc(state));
+        link = StripPointer(arm_thread_state64_get_lr(state));
+        uintptr_t fp = StripPointer(arm_thread_state64_get_fp(state));
+        while (frame_count < kMaxFrames && stack_high && fp >= stack_low &&
+               fp + 16 <= stack_high && !(fp & 0xF)) {
+          const uintptr_t* record = reinterpret_cast<const uintptr_t*>(fp);
+          const uintptr_t next_fp = StripPointer(record[0]);
+          const uintptr_t return_address = StripPointer(record[1]);
+          if (!return_address) {
+            break;
+          }
+          frames[frame_count++] = return_address;
+          if (next_fp <= fp) {
+            break;
+          }
+          fp = next_fp;
+        }
+      }
+      thread_resume(port);
+    }
+    *out_count = frame_count;
+    *out_link = link;
+  }
+
   void SampleThread(const Target& target) {
     uintptr_t frames[kMaxFrames];
     size_t frame_count = 0;
@@ -416,6 +518,31 @@ class PcProfiler {
     ++profile.samples;
     const Symbol& leaf = Lookup(frames[0]);
     ++profile.leaf[leaf.start];
+    {
+      uint64_t key = 0;
+      size_t game_count = 0;
+      uintptr_t game_frames[kGameFrames];
+      for (size_t i = 0; i < frame_count && game_count < kGameFrames; ++i) {
+        const Symbol& symbol = Lookup(i ? frames[i] - 1 : frames[i]);
+        if (symbol.in_game &&
+            (game_count == 0 || game_frames[game_count - 1] != symbol.start)) {
+          game_frames[game_count++] = symbol.start;
+          key = key * UINT64_C(0x100000001B3) ^ symbol.start;
+        }
+      }
+      if (game_count) {
+        ++profile.game[key];
+        if (game_keys_.find(key) == game_keys_.end() && game_keys_.size() < 20000) {
+          std::string text;
+          for (size_t i = 0; i < game_count; ++i) {
+            const auto found = symbols_.find(game_frames[i]);
+            text += (i ? "<" : "") +
+                    (found != symbols_.end() ? found->second.short_name : std::string("?"));
+          }
+          game_keys_.emplace(key, std::move(text));
+        }
+      }
+    }
     {
       uintptr_t engine_frames[2] = {};
       size_t engine_count = 0;
@@ -482,10 +609,24 @@ class PcProfiler {
       symbol.in_system = module.rfind("libsystem_", 0) == 0 || module.rfind("libdyld", 0) == 0;
       symbol.in_engine = module.rfind("librexgpu", 0) == 0 || module.rfind("librexruntime", 0) == 0 ||
                          module.find("MoltenVK") != std::string::npos;
+      symbol.in_game = module.rfind("libcod_", 0) == 0;
       if (info.dli_saddr) {
         symbol.start = reinterpret_cast<uintptr_t>(info.dli_saddr);
       }
       std::string name = info.dli_sname ? info.dli_sname : "";
+      if (symbol.in_game) {
+        std::string short_name = name;
+        for (const char* prefix : {"___imp__sub_", "__imp__sub_", "_sub_", "sub_"}) {
+          if (short_name.rfind(prefix, 0) == 0) {
+            short_name = short_name.substr(std::strlen(prefix)) +
+                         (std::strncmp(prefix, "___imp", 6) == 0 || std::strncmp(prefix, "__imp", 5) == 0
+                              ? "i"
+                              : "");
+            break;
+          }
+        }
+        symbol.short_name = short_name.empty() ? fmt::format("+{:X}", address - base) : short_name;
+      }
       if (name.size() > 70) {
         name.resize(70);
       }
@@ -530,7 +671,7 @@ class PcProfiler {
   void Report() {
     std::vector<ThreadProfile*> sorted;
     for (auto& [name, profile] : profiles_) {
-      if (profile.samples >= 50) {
+      if (profile.samples >= 10) {
         sorted.push_back(&profile);
       }
     }
@@ -542,6 +683,21 @@ class PcProfiler {
                   profile->name, profile->cpu_percent, profile->samples,
                   Top(profile->code, profile->samples), Top(profile->engine, profile->samples, true),
                   Top(profile->leaf, profile->samples));
+      if (!profile->game.empty()) {
+        // The two most frequent chains of game functions (guest addresses,
+        // innermost first, "i" = the original body behind a hook).
+        std::vector<std::pair<uint32_t, uint64_t>> chains;
+        for (const auto& [key, count] : profile->game) {
+          chains.emplace_back(count, key);
+        }
+        std::sort(chains.begin(), chains.end(), std::greater<>());
+        for (size_t i = 0; i < chains.size() && i < 2; ++i) {
+          const auto text = game_keys_.find(chains[i].second);
+          REXLOG_WARN("  Spiel {} {:.0f}%: {}", profile->name,
+                      100.0 * chains[i].first / std::max(profile->samples, 1u),
+                      text != game_keys_.end() ? text->second : std::string("?"));
+        }
+      }
     }
     profiles_.clear();
     // Keep the symbol cache bounded.
@@ -549,6 +705,7 @@ class PcProfiler {
       symbols_by_address_.clear();
       symbols_.clear();
       engine_keys_.clear();
+      game_keys_.clear();
     }
   }
 
@@ -561,6 +718,7 @@ class PcProfiler {
   std::unordered_map<uintptr_t, uintptr_t> symbols_by_address_;
   std::unordered_map<uintptr_t, Symbol> symbols_;
   std::unordered_map<uintptr_t, std::string> engine_keys_;
+  std::unordered_map<uint64_t, std::string> game_keys_;
 };
 
 void ProfilerMain() {
