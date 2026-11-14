@@ -2856,10 +2856,10 @@ index 0dd13f3..da8cc01 100644
      }
    }
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
-index a1b4dad..21d3814 100644
+index a1b4dad..e85e674 100644
 --- a/src/filesystem/virtual_file_system.cpp
 +++ b/src/filesystem/virtual_file_system.cpp
-@@ -13,7 +13,15 @@
+@@ -13,7 +13,18 @@
  #include <rex/logging.h>
  #include <rex/string.h>
  
@@ -2870,12 +2870,15 @@ index a1b4dad..21d3814 100644
 +#include <rex/filesystem/devices/stfs_container_device.h>
 +
 +REXCVAR_DEFINE_BOOL(content_skip_package_movies, true, "Filesystem",
-+                    "Bink movies (.bik) inside content packages (DLC map packs) count as "
-+                    "missing, so the title shows its loading screen without the movie");
++                    "Bink movies (.bik) inside content packages (DLC map packs) are replaced "
++                    "by content_package_movie (a movie of the game disc). Black Ops waits for "
++                    "its loading movie, so the movie cannot simply be left out");
++REXCVAR_DEFINE_STRING(content_package_movie, "game:\\zombie_theater_load.bik", "Filesystem",
++                      "The movie played instead of a movie inside a content package");
  
  REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                      "Not useful to non-developers. Allows code to write to paths "
-@@ -225,10 +233,33 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+@@ -225,10 +236,41 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
  
      auto file_name = rex::string::utf8_find_name_from_guest_path(path);
      entry = parent_entry->GetChild(file_name);
@@ -2894,15 +2897,23 @@ index a1b4dad..21d3814 100644
 +    const std::string& name = entry->name();
 +    if (name.size() > 4 && rex::string::utf8_equal_case(
 +                               std::string_view(name).substr(name.size() - 4), ".bik")) {
-+      static std::mutex logged_mutex;
-+      static std::set<std::string> logged;
-+      {
-+        std::lock_guard<std::mutex> lock(logged_mutex);
-+        if (logged.insert(std::string(path)).second) {
-+          REXFS_WARN("Kartenpaket: Film {} ausgelassen (content_skip_package_movies)", path);
++      // Only a movie of another device (the disc) replaces it; without one
++      // the package's own movie stays (the title waits for its movie).
++      Entry* replacement = ResolvePath(REXCVAR_GET(content_package_movie));
++      if (replacement && !(replacement->attributes() & kFileAttributeDirectory) &&
++          !dynamic_cast<StfsContainerDevice*>(replacement->device())) {
++        static std::mutex logged_mutex;
++        static std::set<std::string> logged;
++        {
++          std::lock_guard<std::mutex> lock(logged_mutex);
++          if (logged.insert(std::string(path)).second) {
++            REXFS_WARN("Kartenpaket: Film {} ersetzt durch {} (content_skip_package_movies)", path,
++                       REXCVAR_GET(content_package_movie));
++          }
 +        }
++        entry = replacement;
++        parent_entry = replacement->parent();
 +      }
-+      entry = nullptr;
 +    }
 +  }
 +
