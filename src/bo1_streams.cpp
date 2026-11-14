@@ -56,9 +56,24 @@ constexpr uintptr_t kLzoCallOffset = 0x163D094;
 constexpr uint32_t kLzoCallWord = 0x97A70FDB;     // bl stub
 constexpr uintptr_t kLzoRecordOffset = 0x1B8F400;
 
+// Build 39 (scripts/module_patches/bo1_sp_stream_job.py): the whole
+// stream_decompress job is done by bo1_stream_job (stub at 0x3000, the start
+// of __imp__sub_8231EA20 branches there instead of to the build 36 guard).
+// A block that does not fit its request's region (English map packs ask the
+// German disc's images.pak for offsets of the international one) is not
+// unpacked: the region is cleared and the job succeeds, so loading goes on.
+// Record at 0x1B8F480 (host words): calls, fallbacks, reason, handle,
+// request, pack entry, pack offset, region, its size, source, length,
+// chunk, its packed size, its size, LZO code, unpacked jobs, 16 bytes.
+constexpr uint32_t kJobHookWord = 0x17DE0978;     // b 0x3000
+constexpr uintptr_t kJobStubOffset = 0x3000;
+constexpr uint32_t kJobStubWord = 0xA9BE7BFD;     // stp x29, x30, [sp, #-32]!
+constexpr uintptr_t kJobRecordOffset = 0x1B8F480;
+
 std::atomic<const uint8_t*> g_guest_base{nullptr};
 std::atomic<const uint8_t*> g_record{nullptr};
 std::atomic<const uint8_t*> g_lzo_record{nullptr};
+std::atomic<const uint8_t*> g_job_record{nullptr};
 
 inline uint32_t Host32(const uint8_t* bytes, size_t offset) {
   uint32_t value;
@@ -78,6 +93,35 @@ const char* LzoError(int32_t code) {
 }
 
 std::string PackPath(const uint8_t* guest, uint32_t entry);
+
+const char* JobReason(uint32_t code) {
+  switch (code) {
+    case 1: return "Kopf eines Teils ausserhalb des Blocks";
+    case 2: return "Teil ausserhalb des Blocks";
+    case 3: return "Teil groesser als der Zielbereich";
+    case 4: return "Teil entpackt nicht";
+    case 5: return "erster Teil groesser als der Zwischenspeicher";
+    case 6: return "Ziel ausserhalb der Anfrage";
+    case 7: return "erster Teil passt nicht ans Ende";
+    default: return "?";
+  }
+}
+
+void LogJobRecord(const uint8_t* guest, const uint8_t* record, uint32_t fallbacks) {
+  std::string head;
+  for (int i = 0; i < 16; ++i) {
+    head += fmt::format("{:02X}", record[64 + i]);
+  }
+  REXLOG_WARN(
+      "Stream-Block passt nicht (insgesamt {} von {} gepackten, Bereich geleert, Laden geht "
+      "weiter): {}, Paket {} Versatz {:X}, Anfrage {}, Bereich {:08X}+{:X}, Block {:08X}+{:X}, "
+      "Teil {} ({:X} gepackt, {:X} entpackt, LZO {}), Anfang {}",
+      fallbacks, Host32(record, 0), JobReason(Host32(record, 8)),
+      PackPath(guest, Host32(record, 20)), Host32(record, 24), Host32(record, 16),
+      Host32(record, 28), Host32(record, 32), Host32(record, 36), Host32(record, 40),
+      Host32(record, 44), Host32(record, 48), Host32(record, 52), int32_t(Host32(record, 56)),
+      head);
+}
 
 void LogLzoRecord(const uint8_t* guest, const uint8_t* record, uint32_t errors) {
   const uint32_t pack_entry = Host32(record, 32);
@@ -177,15 +221,21 @@ void StartBo1StreamWatch(const uint8_t* guest_base, const void* module_base) {
   }
   const auto* module = static_cast<const uint8_t*>(module_base);
   const uint8_t* record = nullptr;
+  const uint8_t* job_record = nullptr;
   if (module) {
     uint32_t guard_word = 0;
     uint32_t hook_word = 0;
+    uint32_t job_stub_word = 0;
     std::memcpy(&guard_word, module + kGuardOffset, 4);
     std::memcpy(&hook_word, module + kHookOffset, 4);
+    std::memcpy(&job_stub_word, module + kJobStubOffset, 4);
     Dl_info info = {};
-    if (guard_word == kGuardFirstWord && hook_word == kHookWord &&
+    if (guard_word == kGuardFirstWord && (hook_word == kHookWord || hook_word == kJobHookWord) &&
         dladdr(module + kRecordOffset, &info) && info.dli_fbase == module_base) {
       record = module + kRecordOffset;
+      if (hook_word == kJobHookWord && job_stub_word == kJobStubWord) {
+        job_record = module + kJobRecordOffset;
+      }
     }
   }
   const uint8_t* lzo_record = nullptr;
@@ -200,14 +250,17 @@ void StartBo1StreamWatch(const uint8_t* guest_base, const void* module_base) {
   }
   g_record = record;
   g_lzo_record = lzo_record;
-  REXLOG_WARN("Black Ops: Stream-Schutz {}, begrenztes Entpacken {}",
-              record ? "aktiv" : "nicht im Spielcode", lzo_record ? "aktiv" : "nicht im Spielcode");
+  g_job_record = job_record;
+  REXLOG_WARN("Black Ops: Stream-Schutz {}, begrenztes Entpacken {}, Stream-Auftrag {}",
+              record ? "aktiv" : "nicht im Spielcode", lzo_record ? "aktiv" : "nicht im Spielcode",
+              job_record ? "geprueft (Build 39)" : "wie im Spiel");
   if (!record) {
     return;
   }
-  std::thread([guest_base, record, lzo_record]() {
+  std::thread([guest_base, record, lzo_record, job_record]() {
     uint32_t reported = 0;
     uint32_t lzo_reported = 0;
+    uint32_t job_reported = 0;
     while (true) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
       bool flush = false;
@@ -224,6 +277,14 @@ void StartBo1StreamWatch(const uint8_t* guest_base, const void* module_base) {
         if (errors != lzo_reported) {
           LogLzoRecord(guest_base, lzo_record, errors);
           lzo_reported = errors;
+          flush = true;
+        }
+      }
+      if (job_record) {
+        const uint32_t fallbacks = Host32(job_record, 4);
+        if (fallbacks != job_reported) {
+          LogJobRecord(guest_base, job_record, fallbacks);
+          job_reported = fallbacks;
           flush = true;
         }
       }
@@ -270,6 +331,18 @@ void Bo1StreamCrashDump(int fd) {
     std::memcpy(&count, record, sizeof(count));
     CrashWrite(fd, "Abgefangene Streams ohne Zielpuffer: ");
     CrashHex(fd, count);
+    CrashWrite(fd, "\n");
+  }
+  if (const uint8_t* job = g_job_record.load()) {
+    CrashWrite(fd, "Stream-Auftraege (Build 39): gepackt ");
+    CrashHex(fd, Host32(job, 0));
+    CrashWrite(fd, ", geleert ");
+    CrashHex(fd, Host32(job, 4));
+    CrashWrite(fd, ", zuletzt Grund/Handle/Anfrage/Paket/Versatz/Bereich/Groesse/Block/Laenge ");
+    for (size_t offset = 8; offset <= 40; offset += 4) {
+      CrashHex(fd, Host32(job, offset));
+      CrashWrite(fd, " ");
+    }
     CrashWrite(fd, "\n");
   }
   if (const uint8_t* lzo = g_lzo_record.load()) {

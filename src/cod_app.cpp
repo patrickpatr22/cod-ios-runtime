@@ -68,7 +68,7 @@ constexpr const char* kLegacyManagedMarker = "# bo2-ios-defaults";
 // Counts app starts for the rotation; renamed per test round so every round
 // starts with profile A.
 constexpr const char* kTestCounterFile = "grafiktest-runde12.txt";
-constexpr const char* kBuildLabel = "Build 38";
+constexpr const char* kBuildLabel = "Build 39";
 
 struct GraphicsProfile {
   const char* letter;
